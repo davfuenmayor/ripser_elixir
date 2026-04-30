@@ -1,0 +1,608 @@
+# Ripser Showcase
+
+```elixir
+Mix.install([
+  {:kino, "~> 0.14"},
+  {:kino_vega_lite, "~> 0.1.13"}
+])
+```
+
+## About
+
+This Livebook demonstrates the standalone Elixir NIF wrapper in this folder.
+The NIF compiles the vendored C++ Ripser implementation:
+
+```text
+c_src/vendor/ripser.cpp
+```
+
+The public API is:
+
+<!-- livebook:{"force_markdown":true} -->
+
+```elixir
+Ripser.compute(input, opts)
+```
+
+It returns:
+
+<!-- livebook:{"force_markdown":true} -->
+
+```elixir
+{:ok, %{intervals: intervals, output: raw_output}}
+```
+
+`intervals` is a map keyed by homology dimension. Each interval is a tuple:
+
+<!-- livebook:{"force_markdown":true} -->
+
+```elixir
+{birth, death}
+{birth, :infinity}
+```
+
+## Compile And Load The Project
+
+Run this notebook from the `ripser_elixir` folder. If Livebook opens it from a
+different working directory, update `project_dir`.
+
+```elixir
+project_dir =
+  cond do
+    File.exists?(Path.join(__DIR__, "mix.exs")) -> __DIR__
+    File.exists?(Path.join(__DIR__, "../mix.exs")) -> Path.expand("..", __DIR__)
+    true -> File.cwd!()
+  end
+
+File.exists?(Path.join(project_dir, "mix.exs"))
+```
+
+```elixir
+{output, status} = System.cmd("mix", ["compile"], cd: project_dir, stderr_to_stdout: true)
+
+if status != 0 do
+  raise output
+end
+
+output
+```
+
+```elixir
+Code.prepend_path(Path.join(project_dir, "_build/dev/lib/ripser/ebin"))
+Application.ensure_all_started(:ripser)
+```
+
+## Helper Functions
+
+```elixir
+defmodule RipserNotebook do
+  def compute!(input, opts) do
+    case Ripser.compute(input, opts) do
+      {:ok, result} -> result
+      {:error, reason} -> raise "Ripser failed: #{reason}"
+    end
+  end
+
+  def point_cloud_text(points) do
+    points
+    |> Enum.map(fn point ->
+      point
+      |> Enum.map(&format_float/1)
+      |> Enum.join(" ")
+    end)
+    |> Enum.join("\n")
+  end
+
+  def full_distance_matrix_text(points) do
+    points
+    |> Enum.map(fn p ->
+      points
+      |> Enum.map(fn q -> euclidean(p, q) |> format_float() end)
+      |> Enum.join(" ")
+    end)
+    |> Enum.join("\n")
+  end
+
+  def lower_distance_matrix_text(points) do
+    points
+    |> Enum.with_index()
+    |> Enum.flat_map(fn {p, i} ->
+      points
+      |> Enum.take(i)
+      |> Enum.map(fn q -> euclidean(p, q) |> format_float() end)
+    end)
+    |> Enum.join(" ")
+  end
+
+  def upper_distance_matrix_text(points) do
+    points
+    |> Enum.with_index()
+    |> Enum.flat_map(fn {p, i} ->
+      points
+      |> Enum.drop(i + 1)
+      |> Enum.map(fn q -> euclidean(p, q) |> format_float() end)
+    end)
+    |> Enum.join(" ")
+  end
+
+  def sparse_triplets_text(points, threshold) do
+    for {p, i} <- Enum.with_index(points),
+        {q, j} <- Enum.with_index(points),
+        i < j,
+        distance = euclidean(p, q),
+        distance <= threshold do
+      "#{i} #{j} #{format_float(distance)}"
+    end
+    |> Enum.join("\n")
+  end
+
+  def circle_points(count, radius \\ 1.0) do
+    for i <- 0..(count - 1) do
+      angle = 2.0 * :math.pi() * i / count
+      [radius * :math.cos(angle), radius * :math.sin(angle)]
+    end
+  end
+
+  def two_circle_points(count_per_circle \\ 24) do
+    left = circle_points(count_per_circle, 1.0) |> Enum.map(fn [x, y] -> [x - 1.4, y] end)
+    right = circle_points(count_per_circle, 1.0) |> Enum.map(fn [x, y] -> [x + 1.4, y] end)
+    left ++ right
+  end
+
+  def annulus_points(radial_count \\ 3, angular_count \\ 24) do
+    for ring <- 0..(radial_count - 1),
+        i <- 0..(angular_count - 1) do
+      radius = 0.8 + ring * 0.25
+      angle = 2.0 * :math.pi() * (i + ring * 0.17) / angular_count
+      [radius * :math.cos(angle), radius * :math.sin(angle)]
+    end
+  end
+
+  def sphere_points(latitude_count \\ 5, longitude_count \\ 10) do
+    for lat <- 1..latitude_count,
+        lon <- 0..(longitude_count - 1) do
+      theta = :math.pi() * lat / (latitude_count + 1)
+      phi = 2.0 * :math.pi() * lon / longitude_count
+      [
+        :math.sin(theta) * :math.cos(phi),
+        :math.sin(theta) * :math.sin(phi),
+        :math.cos(theta)
+      ]
+    end
+  end
+
+  def interval_table(intervals) do
+    intervals
+    |> Enum.flat_map(fn {dim, entries} ->
+      Enum.with_index(entries, 1)
+      |> Enum.map(fn {{birth, death}, index} ->
+        %{
+          dimension: dim,
+          interval: index,
+          birth: birth,
+          death: death
+        }
+      end)
+    end)
+    |> Kino.DataTable.new()
+  end
+
+  def longest_intervals(intervals, limit \\ 12) do
+    intervals
+    |> Enum.flat_map(fn {dim, entries} ->
+      Enum.map(entries, fn {birth, death} ->
+        persistence =
+          case death do
+            :infinity -> :infinity
+            finite -> finite - birth
+          end
+
+        %{dimension: dim, birth: birth, death: death, persistence: persistence}
+      end)
+    end)
+    |> Enum.sort_by(
+      fn
+        %{persistence: :infinity} -> {1, 0.0}
+        %{persistence: value} -> {0, value}
+      end,
+      :desc
+    )
+    |> Enum.take(limit)
+    |> Kino.DataTable.new()
+  end
+
+  def barcode(intervals, title \\ "Persistence Barcode") do
+    rows =
+      intervals
+      |> Enum.flat_map(fn {dim, entries} ->
+        Enum.with_index(entries, 1)
+        |> Enum.map(fn {{birth, death}, index} ->
+          finite_death = if death == :infinity, do: birth + 1.0, else: death
+
+          %{
+            "dimension" => "H#{dim}",
+            "interval" => "H#{dim}-#{index}",
+            "birth" => birth,
+            "death" => finite_death,
+            "infinite" => death == :infinity
+          }
+        end)
+      end)
+
+    plot =
+      VegaLite.new(width: 700, height: 260, title: title)
+      |> VegaLite.data_from_values(rows)
+      |> VegaLite.mark(:bar)
+      |> VegaLite.encode_field(:y, "interval", type: :nominal, sort: nil, title: nil)
+      |> VegaLite.encode_field(:x, "birth", type: :quantitative, title: "Birth")
+      |> VegaLite.encode_field(:x2, "death")
+      |> VegaLite.encode_field(:color, "dimension", type: :nominal)
+      |> VegaLite.encode_field(:stroke_dash, "infinite", type: :nominal, title: "Infinite death")
+
+    Kino.VegaLite.new(plot)
+  end
+
+  def scatter_2d(points, title \\ "Point Cloud", axes \\ {0, 1}) do
+    {x_axis, y_axis} = axes
+
+    rows =
+      points
+      |> Enum.with_index()
+      |> Enum.map(fn {point, index} ->
+        %{
+          "index" => index,
+          "x" => Enum.at(point, x_axis),
+          "y" => Enum.at(point, y_axis)
+        }
+      end)
+
+    plot =
+      VegaLite.new(width: 520, height: 380, title: title)
+      |> VegaLite.data_from_values(rows)
+      |> VegaLite.mark(:point, filled: true, size: 70, opacity: 0.85)
+      |> VegaLite.encode_field(:x, "x", type: :quantitative, title: "axis #{x_axis}")
+      |> VegaLite.encode_field(:y, "y", type: :quantitative, title: "axis #{y_axis}")
+      |> VegaLite.encode_field(:tooltip, "index", type: :quantitative)
+
+    Kino.VegaLite.new(plot)
+  end
+
+  def persistence_by_dimension(intervals) do
+    rows =
+      intervals
+      |> Enum.map(fn {dim, entries} ->
+        finite =
+          entries
+          |> Enum.reject(fn {_birth, death} -> death == :infinity end)
+          |> Enum.map(fn {birth, death} -> death - birth end)
+
+        %{
+          dimension: "H#{dim}",
+          count: length(entries),
+          finite_count: length(finite),
+          max_finite_persistence: Enum.max(finite, fn -> 0.0 end)
+        }
+      end)
+
+    Kino.DataTable.new(rows)
+  end
+
+  defp euclidean(p, q) do
+    p
+    |> Enum.zip(q)
+    |> Enum.map(fn {a, b} -> :math.pow(a - b, 2) end)
+    |> Enum.sum()
+    |> :math.sqrt()
+  end
+
+  defp format_float(value), do: :erlang.float_to_binary(value * 1.0, decimals: 6)
+end
+```
+
+## What This Wrapper Demonstrates
+
+Ripser computes Vietoris-Rips persistence intervals. This notebook covers the
+wrapper's exposed inputs and options:
+
+* `:point_cloud`
+* `:distance`
+* `:lower_distance`
+* `:upper_distance`
+* `:sparse`
+* `:dipha`
+* `:binary`
+* `:threshold`
+* `:ratio`
+* `:modulus`
+* homology dimensions via `:dim`
+
+```elixir
+    [
+      %{
+        capability: "Point cloud input",
+        wrapper_usage: "format: :point_cloud",
+        demonstrated_in: "Circle, two circles, annulus, sphere"
+      },
+      %{
+        capability: "Full distance matrix input",
+        wrapper_usage: "format: :distance",
+        demonstrated_in: "Same circle, different input formats"
+      },
+      %{
+        capability: "Lower triangular distance matrix input",
+        wrapper_usage: "format: :lower_distance",
+        demonstrated_in: "Same circle, different input formats"
+      },
+      %{
+        capability: "Upper triangular distance matrix input",
+        wrapper_usage: "format: :upper_distance",
+        demonstrated_in: "Same circle, different input formats"
+      },
+      %{
+        capability: "Sparse triplet input",
+        wrapper_usage: "format: :sparse",
+        demonstrated_in: "Sparse circle graph"
+      },
+      %{
+        capability: "DIPHA distance matrix input",
+        wrapper_usage: "format: :dipha",
+        demonstrated_in: "Documented API and test suite"
+      },
+      %{
+        capability: "Binary lower distance matrix input",
+        wrapper_usage: "format: :binary",
+        demonstrated_in: "Documented API and test suite"
+      },
+      %{
+        capability: "Maximum homology dimension",
+        wrapper_usage: "dim: 0, dim: 1, dim: 2",
+        demonstrated_in: "Sphere up to H2"
+      },
+      %{
+        capability: "Rips diameter threshold",
+        wrapper_usage: "threshold: value",
+        demonstrated_in: "Threshold comparison"
+      },
+      %{
+        capability: "Persistence ratio filter",
+        wrapper_usage: "ratio: value",
+        demonstrated_in: "Annulus with ratio filter"
+      },
+      %{
+        capability: "Prime field coefficients",
+        wrapper_usage: "modulus: prime",
+        demonstrated_in: "Documented API and test suite"
+      }
+    ]
+    |> Kino.DataTable.new()
+```
+
+## Example 1: A Circle Point Cloud
+
+```elixir
+circle_points = RipserNotebook.circle_points(36)
+RipserNotebook.scatter_2d(circle_points, "36 Points Sampled From A Circle")
+```
+
+```elixir
+circle =
+  RipserNotebook.compute!(
+    RipserNotebook.point_cloud_text(circle_points),
+    format: :point_cloud,
+    dim: 1
+  )
+
+RipserNotebook.persistence_by_dimension(circle.intervals)
+```
+
+```elixir
+RipserNotebook.longest_intervals(circle.intervals, 10)
+```
+
+```elixir
+RipserNotebook.barcode(circle.intervals, "Circle Point Cloud")
+```
+
+## Example 2: Two Circles
+
+A pair of circles produces more than one prominent one-dimensional feature.
+
+```elixir
+two_circles_points = RipserNotebook.two_circle_points(28)
+RipserNotebook.scatter_2d(two_circles_points, "Two Circle Point Cloud")
+```
+
+```elixir
+two_circles =
+  RipserNotebook.compute!(
+    RipserNotebook.point_cloud_text(two_circles_points),
+    format: :point_cloud,
+    dim: 1
+  )
+
+RipserNotebook.longest_intervals(two_circles.intervals, 12)
+```
+
+```elixir
+RipserNotebook.barcode(two_circles.intervals, "Two Circles")
+```
+
+## Example 3: Annulus
+
+An annulus is a filled ring. The central hole should appear as a persistent
+`H1` interval, but the extra radial samples make the short intervals noisier.
+
+```elixir
+annulus_points = RipserNotebook.annulus_points(3, 26)
+RipserNotebook.scatter_2d(annulus_points, "Annulus Point Cloud")
+```
+
+```elixir
+annulus =
+  RipserNotebook.compute!(
+    RipserNotebook.point_cloud_text(annulus_points),
+    format: :point_cloud,
+    dim: 1
+  )
+
+RipserNotebook.longest_intervals(annulus.intervals, 12)
+```
+
+```elixir
+RipserNotebook.barcode(annulus.intervals, "Annulus")
+```
+
+## Example 4: Sphere-Like Point Cloud Up To H2
+
+This example samples a small sphere and asks for homology up to dimension `2`.
+It is intentionally small; higher-dimensional Vietoris-Rips computations grow
+quickly.
+
+```elixir
+sphere_points = RipserNotebook.sphere_points(4, 8)
+RipserNotebook.scatter_2d(sphere_points, "Sphere Projection", {0, 2})
+```
+
+```elixir
+sphere =
+  RipserNotebook.compute!(
+    RipserNotebook.point_cloud_text(sphere_points),
+    format: :point_cloud,
+    dim: 2,
+    threshold: 1.45
+  )
+
+RipserNotebook.persistence_by_dimension(sphere.intervals)
+```
+
+```elixir
+RipserNotebook.barcode(sphere.intervals, "Small Sphere Sample")
+```
+
+## Example 5: Same Circle, Different Input Formats
+
+Ripser can consume point clouds directly, or precomputed distance matrices.
+The wrapper supports full, lower-triangular, and upper-triangular distance
+matrix text.
+
+```elixir
+small_circle_points = RipserNotebook.circle_points(10)
+
+point_cloud_result =
+  RipserNotebook.compute!(
+    RipserNotebook.point_cloud_text(small_circle_points),
+    format: :point_cloud,
+    dim: 1
+  )
+
+full_matrix_result =
+  RipserNotebook.compute!(
+    RipserNotebook.full_distance_matrix_text(small_circle_points),
+    format: :distance,
+    dim: 1
+  )
+
+lower_matrix_result =
+  RipserNotebook.compute!(
+    RipserNotebook.lower_distance_matrix_text(small_circle_points),
+    format: :lower_distance,
+    dim: 1
+  )
+
+upper_matrix_result =
+  RipserNotebook.compute!(
+    RipserNotebook.upper_distance_matrix_text(small_circle_points),
+    format: :upper_distance,
+    dim: 1
+  )
+
+%{
+  point_cloud: point_cloud_result.intervals,
+  full_distance_matrix: full_matrix_result.intervals,
+  lower_distance_matrix: lower_matrix_result.intervals,
+  upper_distance_matrix: upper_matrix_result.intervals
+}
+```
+
+## Example 6: Threshold And Ratio
+
+`threshold:` limits the largest diameter included in the Rips complex. `ratio:`
+filters printed intervals by death/birth ratio in positive dimensions.
+
+```elixir
+threshold_comparison_points = RipserNotebook.circle_points(24)
+
+low_threshold =
+  RipserNotebook.compute!(
+    RipserNotebook.point_cloud_text(threshold_comparison_points),
+    format: :point_cloud,
+    dim: 1,
+    threshold: 0.45
+  )
+
+RipserNotebook.persistence_by_dimension(low_threshold.intervals)
+```
+
+```elixir
+high_threshold =
+  RipserNotebook.compute!(
+    RipserNotebook.point_cloud_text(threshold_comparison_points),
+    format: :point_cloud,
+    dim: 1,
+    threshold: 1.8
+  )
+
+RipserNotebook.persistence_by_dimension(high_threshold.intervals)
+```
+
+```elixir
+RipserNotebook.barcode(high_threshold.intervals, "Circle With Larger Threshold")
+```
+
+```elixir
+ratio_filtered =
+  RipserNotebook.compute!(
+    RipserNotebook.point_cloud_text(annulus_points),
+    format: :point_cloud,
+    dim: 1,
+    ratio: 1.8
+  )
+
+RipserNotebook.barcode(ratio_filtered.intervals, "Annulus With Ratio Filter")
+```
+
+## Example 7: Sparse Triplet Input
+
+Sparse input is a list of `i j distance` rows.
+
+```elixir
+sparse_points = RipserNotebook.circle_points(18)
+sparse_input = RipserNotebook.sparse_triplets_text(sparse_points, 0.8)
+
+sparse =
+  RipserNotebook.compute!(
+    sparse_input,
+    format: :sparse,
+    dim: 1
+  )
+
+sparse.intervals
+```
+
+```elixir
+RipserNotebook.barcode(sparse.intervals, "Sparse Circle Graph")
+```
+
+```elixir
+sparse.output
+```
+
+## Cleanup
+
+Generated artifacts live in:
+
+```text
+_build/
+priv/ripser_nif.so
+c_src/build/
+```

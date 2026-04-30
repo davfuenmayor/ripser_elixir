@@ -1,0 +1,3 @@
+/_build
+/c_src/build
+/priv/*.so

@@ -1,6 +1,8 @@
 # Ripser Elixir NIF
 
-Standalone Elixir NIF wrapper for the C++ Ripser implementation.
+Standalone Elixir NIF wrapper for the C++ [Ripser](https://github.com/Ripser/ripser) implementation.
+
+Ripser is a high-performance C++ library for computing persistent homology via Vietoris–Rips persistence barcodes, commonly used in topological data analysis (TDA) to extract multiscale topological features from point-cloud or distance-matrix data.
 
 The upstream `ripser.cpp` source is vendored under `c_src/vendor/` so the
 project can compile without modifying or depending on the original Ripser
@@ -32,3 +34,11 @@ To build against a different `ripser.cpp`, override the source path:
 ```sh
 RIPSER_CPP=/path/to/ripser.cpp mix test
 ```
+
+## License
+
+This project is licensed under the MIT License. See `LICENSE`.
+
+This project includes or wraps code from
+[Ripser](https://github.com/Ripser/ripser), which is also licensed under the
+MIT License and is copyright (c) 2015–2021 Ulrich Bauer.
